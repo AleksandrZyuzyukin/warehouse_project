@@ -20,11 +20,11 @@ def write_csv(path, rows):
 
 def run(day, output, seed=SEED):
     stock = deepcopy(INITIAL_STOCK)
-    initial_boxes = sum(total_boxes(item["pallets"]) for item in stock.values())
-    orders = generate_orders(day, tuple(stock), seed)
+    initial_boxes = sum(total_boxes(item["pallets"]) for item in stock.values())# кол-во товаров каждого типа
+    orders = generate_orders(day, tuple(stock), seed)#генерация заказов
     operations = process_orders(stock, orders)
 
-    stock_rows = []
+    stock_rows = []#таблица остатков
     for sku, item in stock.items():
         assert all(0 < boxes <= PALLET_CAPACITY for boxes in item["pallets"])
         stock_rows.append({
@@ -33,7 +33,7 @@ def run(day, output, seed=SEED):
             "occupied_cells": occupied_cells(item["pallets"]),
         })
 
-    zone_rows = []
+    zone_rows = []#таблица зон склада
     for zone, capacity in ZONE_CAPACITY.items():
         occupied = sum(row["occupied_cells"] for row in stock_rows if row["zone"] == zone)
         assert occupied <= capacity
@@ -57,7 +57,7 @@ def run(day, output, seed=SEED):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     order_rows = [{"date": order["date"], "order_id": order["order_id"], **line}
-                  for order in orders for line in order["lines"]]
+                  for order in orders for line in order["lines"]]# таблица заказов
     write_csv(output / "orders.csv", order_rows)
     write_csv(output / "operations.csv", operations)
     write_csv(output / "stock.csv", stock_rows)
