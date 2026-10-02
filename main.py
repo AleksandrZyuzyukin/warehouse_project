@@ -10,43 +10,50 @@ from pathlib import Path
 from config import INITIAL_STOCK, SEED, SIMULATION_DAYS, ZONE_CAPACITY
 from oms import generate_orders
 from wms import (occupied_cells, plan_replenishment, process_orders,
-                 receive_deliveries, total_boxes, validate_stock)
+                 receive_deliveries, total_boxes, validate_stock, reserve_orders, reserved_boxes)
 
 
 FIELDS = {
-    "orders": ["date", "order_id", "sku", "boxes"],
+    "orders": ["date", "order_id", "created_at", "deadline", "sku", "boxes"],
+    "reservations": ["date", "order_id", "sku", "deadline", "created_at",
+                     "requested_boxes", "reserved_before_boxes", "new_reserved_boxes",
+                     "reserved_boxes", "unreserved_boxes", "available_after_boxes"],
     "operations": ["date", "order_date", "order_id", "sku", "zone",
-                   "requested_boxes", "shipped_boxes", "unfulfilled_boxes"],
+                   "requested_boxes", "shipped_boxes", "unfulfilled_boxes",
+                   "created_at", "deadline", "reserved_boxes", "late_shipped_boxes", "overdue_boxes"],
     "receipts": ["date", "supply_id", "sku", "zone", "offered_boxes",
                  "accepted_boxes", "unaccepted_boxes"],
     "replenishment": ["date", "supply_id", "sku", "zone", "stock_boxes",
                       "pending_boxes", "incoming_boxes", "stock_position",
                       "ordered_boxes", "arrival_date", "position_after_order"],
     "stock": ["date", "sku", "zone", "stock_boxes", "occupied_cells",
-              "pending_boxes", "incoming_boxes", "stock_position"],
+              "pending_boxes", "incoming_boxes", "stock_position", "reserved_boxes", "available_boxes"],
     "zones": ["date", "zone", "occupied_cells", "capacity_cells",
               "utilization", "shipped_boxes"],
-    "pending_orders": ["date", "order_date", "order_id", "sku", "boxes"],
+    "pending_orders": ["date", "order_date", "order_id", "created_at", "deadline",
+                       "sku", "boxes", "reserved_boxes", "overdue_boxes"],
     "supplies": ["date", "supply_id", "sku", "created_date", "arrival_date",
                  "ordered_boxes", "remaining_boxes", "status"],
     "summary": ["date", "seed", "orders", "requested_boxes", "backlog_start_boxes",
                 "accepted_boxes", "shipped_boxes", "unfulfilled_boxes",
-                "pending_orders", "stock_boxes", "ordered_boxes", "incoming_boxes"],
+                "pending_orders", "stock_boxes", "ordered_boxes", "incoming_boxes",
+                "late_shipped_boxes", "overdue_boxes"],
 }
 
 
-def write_csv(path, rows, fieldnames):#запись таблицы в CSV-файл с заголовками, даже если строк нет
+def write_csv(path, rows, fieldnames):#запись таблицы в CSV с заголовками
+    # Заголовок сохраняется даже при отсутствии строк.
     with path.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def order_boxes(orders):#общее количество коробок во всех строках переданных заказов
+def order_boxes(orders):#общее количество коробок в строках заказов
     return sum(line["boxes"] for order in orders for line in order["lines"])
 
 
-def run(day, output, seed=SEED, days=SIMULATION_DAYS):#моделирование последовательных дней с переносом остатков, незавершённых заказов и поставок. Сохранение таблиц и конечного состояния склада
+def run(day, output, seed=SEED, days=SIMULATION_DAYS):#моделирование последовательных дней и сохранение результатов
     if type(days) is not int or days <= 0:
         raise ValueError("Число дней должно быть положительным целым")
     stock = deepcopy(INITIAL_STOCK)
@@ -62,7 +69,10 @@ def run(day, output, seed=SEED, days=SIMULATION_DAYS):#моделировани�
 
         receipts = receive_deliveries(stock, supplies, current)
         orders = generate_orders(current, tuple(stock), seed)
-        operations, pending = process_orders(stock, pending + orders, current)
+        queue = pending + deepcopy(orders)
+        reservations = reserve_orders(stock, queue, current)
+        tables["reservations"].extend(reservations)
+        operations, pending = process_orders(stock, queue, current)
         requests = plan_replenishment(stock, pending, supplies, current)
         validate_stock(stock)
 
@@ -77,14 +87,21 @@ def run(day, output, seed=SEED, days=SIMULATION_DAYS):#моделировани�
             raise ValueError(f"Нарушен баланс заказов: {date_text}")
 
         tables["orders"].extend(
-            {"date": order["date"], "order_id": order["order_id"], **line}
+            {"date": order["date"], "order_id": order["order_id"],
+             "created_at": order.get("created_at", order["date"] + "T00:00:00"),
+             "deadline": order.get("deadline", order["date"]),
+             "sku": line["sku"], "boxes": line["boxes"]}
             for order in orders for line in order["lines"])
         tables["operations"].extend(operations)
         tables["receipts"].extend(receipts)
         tables["replenishment"].extend(requests)
         tables["pending_orders"].extend(
             {"date": date_text, "order_date": order["date"],
-             "order_id": order["order_id"], **line}
+             "order_id": order["order_id"],
+             "created_at": order.get("created_at", order["date"] + "T00:00:00"),
+             "deadline": order.get("deadline", order["date"]),
+             "overdue_boxes": line["boxes"] if date_text >= order.get("deadline", order["date"]) else 0,
+             **line}
             for order in pending for line in order["lines"])
         tables["supplies"].extend(
             {"date": date_text, **supply,
@@ -102,6 +119,8 @@ def run(day, output, seed=SEED, days=SIMULATION_DAYS):#моделировани�
                 "stock_boxes": physical, "occupied_cells": occupied_cells(item["pallets"]),
                 "pending_boxes": demand, "incoming_boxes": incoming,
                 "stock_position": physical - demand + incoming,
+                "reserved_boxes": reserved_boxes(pending, sku),
+                "available_boxes": physical - reserved_boxes(pending, sku),
             })
         for zone, capacity in ZONE_CAPACITY.items():
             occupied = sum(occupied_cells(item["pallets"]) for item in stock.values()
@@ -121,6 +140,8 @@ def run(day, output, seed=SEED, days=SIMULATION_DAYS):#моделировани�
             "stock_boxes": sum(total_boxes(item["pallets"]) for item in stock.values()),
             "ordered_boxes": sum(row["ordered_boxes"] for row in requests),
             "incoming_boxes": sum(supply["remaining_boxes"] for supply in supplies),
+            "late_shipped_boxes": sum(row["late_shipped_boxes"] for row in operations),
+            "overdue_boxes": sum(row["overdue_boxes"] for row in operations),
         })
 
     output = Path(output)
@@ -133,7 +154,7 @@ def run(day, output, seed=SEED, days=SIMULATION_DAYS):#моделировани�
     return tables["summary"]
 
 
-def main():#чтение параметров запуска, запуск моделирования и вывод итогов
+def main():#чтение параметров, запуск моделирования и вывод итогов
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--date", type=date.fromisoformat, default=date(2026, 9, 28))
     parser.add_argument("--days", type=int, default=SIMULATION_DAYS)

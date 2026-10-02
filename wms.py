@@ -6,20 +6,20 @@ from config import (
 )
 
 
-def total_boxes(pallets):
+def total_boxes(pallets):#общее количество коробок на паллетах
     return sum(pallets)
 
 
-def occupied_cells(pallets):
+def occupied_cells(pallets):#количество занятых ячеек
     return len(pallets)
 
 
-def check_quantity(quantity):
+def check_quantity(quantity):#проверка целого неотрицательного количества
     if type(quantity) is not int or quantity < 0:
         raise ValueError("Количество должно быть целым и неотрицательным")
 
 
-def ship_boxes(pallets, requested):#списание товара со склада. Сначала забираем товары с последней паллеты. 
+def ship_boxes(pallets, requested):#списание товара, сначала с неполных паллет
     check_quantity(requested)
     result = sorted(pallets, reverse=True)
     shipped = min(requested, total_boxes(result))
@@ -33,12 +33,13 @@ def ship_boxes(pallets, requested):#списание товара со скла�
     return result, shipped, requested - shipped
 
 
-def receive_boxes(stock, sku, requested):#приёмка товара одного SKU. Сначала заполняем неполные паллеты, затем занимаем свободные ячейки с учётом лимитов SKU и зоны    
+def receive_boxes(stock, sku, requested):#приёмка SKU с учётом лимитов ячеек товара и зоны
     check_quantity(requested)
     item = stock[sku]
     pallets = item["pallets"]
     remaining = requested
 
+    # Заполнение существующих паллет не требует новых ячеек.
     for index in sorted(range(len(pallets)), key=lambda i: pallets[i]):
         accepted = min(remaining, PALLET_CAPACITY - pallets[index])
         pallets[index] += accepted
@@ -60,7 +61,7 @@ def receive_boxes(stock, sku, requested):#приёмка товара одног
     return requested - remaining, remaining
 
 
-def receive_deliveries(stock, supplies, day):#приёмка прибывших поставок. Непринятые коробки оставляем в очереди на следующие дни
+def receive_deliveries(stock, supplies, day):#приёмка прибывших поставок и перенос непринятой части
     receipts = []
     for supply in supplies:
         if supply["arrival_date"] > day.isoformat():
@@ -78,29 +79,91 @@ def receive_deliveries(stock, supplies, day):#приёмка прибывших 
     return receipts
 
 
-def process_orders(stock, orders, day):#обработка заказов от старых к новым. Записываем операции и сохраняем невыполненные части заказов
+def priority_key(order):#приоритет по сроку отправки, времени поступления и идентификатору
+    return (order.get("deadline", order["date"]),
+            order.get("created_at", order["date"] + "T00:00:00"), order["order_id"])
+
+
+def reserved_boxes(orders, sku):#количество коробок SKU, закреплённых за строками заказов
+    return sum(line.get("reserved_boxes", 0) for order in orders
+               for line in order["lines"] if line["sku"] == sku)
+
+
+def validate_reservations(stock, orders):#проверка резервов по строкам и соответствия физическому остатку
+    for order in orders:
+        for line in order["lines"]:
+            check_quantity(line["boxes"])
+            reserved = line.get("reserved_boxes", 0)
+            check_quantity(reserved)
+            if line["sku"] not in stock or reserved > line["boxes"]:
+                raise ValueError("Некорректный резерв строки заказа")
+    for sku in stock:
+        if reserved_boxes(orders, sku) > total_boxes(stock[sku]["pallets"]):
+            raise ValueError(f"Резерв превышает физический остаток {sku}")
+
+
+def reserve_orders(stock, orders, day):#распределение доступного товара по приоритету без изменения паллет
+    validate_reservations(stock, orders)
+    available = {sku: total_boxes(item["pallets"]) - reserved_boxes(orders, sku)
+                 for sku, item in stock.items()}
+    reservations = []
+    for order in sorted(orders, key=priority_key):
+        if order["date"] > day.isoformat():
+            raise ValueError("Нельзя резервировать ещё не поступивший заказ")
+        for line in order["lines"]:
+            sku = line["sku"]
+            before = line.get("reserved_boxes", 0)
+            added = min(line["boxes"] - before, available[sku])
+            line["reserved_boxes"] = before + added
+            available[sku] -= added
+            reservations.append({
+                "date": day.isoformat(), "order_id": order["order_id"],
+                "sku": sku, "deadline": order.get("deadline", order["date"]),
+                "created_at": order.get("created_at", order["date"] + "T00:00:00"),
+                "requested_boxes": line["boxes"], "reserved_before_boxes": before,
+                "new_reserved_boxes": added, "reserved_boxes": line["reserved_boxes"],
+                "unreserved_boxes": line["boxes"] - line["reserved_boxes"],
+                "available_after_boxes": available[sku],
+            })
+    validate_reservations(stock, orders)
+    return reservations
+
+
+def process_orders(stock, orders, day):#отгрузка только из резервов по приоритету и перенос невыполненных частей
+    validate_reservations(stock, orders)
     operations, pending = [], []
-    for order in sorted(orders, key=lambda row: (row["date"], row["order_id"])):
+    for order in sorted(orders, key=priority_key):
         pending_lines = []
         for line in order["lines"]:
             sku = line["sku"]
-            pallets, shipped, unfulfilled = ship_boxes(stock[sku]["pallets"], line["boxes"])
+            reserved = line.get("reserved_boxes", 0)
+            pallets, shipped, shortage = ship_boxes(stock[sku]["pallets"], reserved)
+            if shortage:
+                raise ValueError("Недостаточно товара для исполнения резерва")
             stock[sku]["pallets"] = pallets
+            line["reserved_boxes"] = reserved - shipped
+            unfulfilled = line["boxes"] - shipped
+            deadline = order.get("deadline", order["date"])
+            late = day.isoformat() > deadline
             operations.append({
                 "date": day.isoformat(), "order_date": order["date"],
-                "order_id": order["order_id"], "sku": sku,
+                "created_at": order.get("created_at", order["date"] + "T00:00:00"),
+                "deadline": deadline, "order_id": order["order_id"], "sku": sku,
                 "zone": stock[sku]["zone"], "requested_boxes": line["boxes"],
-                "shipped_boxes": shipped, "unfulfilled_boxes": unfulfilled,
+                "reserved_boxes": reserved, "shipped_boxes": shipped,
+                "unfulfilled_boxes": unfulfilled, "late_shipped_boxes": shipped if late else 0,
+                "overdue_boxes": unfulfilled if day.isoformat() >= deadline else 0,
             })
             if unfulfilled:
-                pending_lines.append({"sku": sku, "boxes": unfulfilled})
+                pending_lines.append({"sku": sku, "boxes": unfulfilled,
+                                      "reserved_boxes": line["reserved_boxes"]})
         if pending_lines:
-            pending.append({"order_id": order["order_id"], "date": order["date"],
-                            "lines": pending_lines})
+            pending.append({**order, "lines": pending_lines})
+    validate_reservations(stock, pending)
     return operations, pending
 
 
-def plan_replenishment(stock, pending, supplies, day):#расчёт позиции запаса. При значении до 240 включительно заказываем пополнение до 420 с учётом спроса и ожидаемых поставок
+def plan_replenishment(stock, pending, supplies, day):#пополнение позиции запаса с учётом спроса и поставок
     requests = []
     for sku, item in stock.items():
         demand = sum(line["boxes"] for order in pending for line in order["lines"]
@@ -129,7 +192,7 @@ def plan_replenishment(stock, pending, supplies, day):#расчёт позици
     return requests
 
 
-def validate_stock(stock):#проверка зон хранения, количества коробок на паллетах и лимитов ячеек по SKU и зонам
+def validate_stock(stock):#проверка паллет, зон и лимитов ячеек
     for sku, item in stock.items():
         if item["zone"] not in ZONE_CAPACITY:
             raise ValueError(f"Неизвестная зона для {sku}")
