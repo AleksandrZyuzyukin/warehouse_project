@@ -4,17 +4,26 @@ from copy import deepcopy
 from datetime import date, datetime, time, timedelta
 
 import config
+from conditions import Conditions
 from wms import total_boxes, receive_boxes, ship_boxes, validate_stock
 
 
 class Warehouse:
-    def __init__(self, stock=None, settings=None):#начальное состояние склада и параметры моделирования
+    def __init__(self, stock=None, settings=None, seed=config.SEED):#начальное состояние склада и параметры моделирования
         names = ('SHIFT_START_MINUTE', 'SHIFT_END_MINUTE', 'EMPLOYEES', 'EQUIPMENT',
                  'RECEIPT_MINUTES', 'PICK_MINUTES', 'LOAD_MINUTES', 'WAITING_CAPACITY',
                  'TRUCK_CAPACITY', 'TRUCK_SCHEDULE', 'REORDER_POINT',
-                 'TARGET_STOCK_POSITION', 'SUPPLY_LEAD_DAYS')
+                 'TARGET_STOCK_POSITION', 'SUPPLY_LEAD_DAYS', 'VARIABILITY_ENABLED',
+                 'TRUCK_NO_SHOW_INTERVAL_DAYS', 'TRUCK_DELAY_PROBABILITY', 'TRUCK_DELAY_MINUTES',
+                 'SUPPLY_INTRADAY_DELAY_PROBABILITY', 'SUPPLY_DAY_DELAY_PROBABILITY',
+                 'SUPPLY_INTRADAY_DELAY_MINUTES', 'SUPPLY_DELAY_DAYS', 'ABSENCE_DAYS_PER_MONTH',
+                 'EQUIPMENT_DOWNTIME_PROBABILITY', 'EQUIPMENT_DOWNTIME_MINUTES')
         self.settings = {name: getattr(config, name) for name in names}
         self.settings.update(settings or {})
+        self.conditions = Conditions(seed, self.settings)
+        self.shift_conditions = {}
+        self.present_workers = {f'W{i+1}' for i in range(self.settings['EMPLOYEES'])}
+        self.blocked_equipment = set()
         self.stock = deepcopy(config.INITIAL_STOCK if stock is None else stock)
         validate_stock(self.stock)
         self.initial = {sku: total_boxes(item['pallets']) for sku, item in self.stock.items()}
@@ -31,6 +40,21 @@ class Warehouse:
                 raise ValueError(f'Некорректный параметр {name}')
         if not 0 <= self.settings['SHIFT_START_MINUTE'] < self.settings['SHIFT_END_MINUTE'] < 1440:
             raise ValueError('Некорректное время смены')
+        for name in ('TRUCK_DELAY_PROBABILITY', 'SUPPLY_INTRADAY_DELAY_PROBABILITY',
+                     'SUPPLY_DAY_DELAY_PROBABILITY', 'EQUIPMENT_DOWNTIME_PROBABILITY'):
+            if not 0 <= self.settings[name] <= 1:
+                raise ValueError(f'Некорректная вероятность {name}')
+        if self.settings['SUPPLY_INTRADAY_DELAY_PROBABILITY'] + self.settings['SUPPLY_DAY_DELAY_PROBABILITY'] > 1:
+            raise ValueError('Сумма вероятностей задержки поставки превышает 1')
+        if self.settings['TRUCK_NO_SHOW_INTERVAL_DAYS'] < 90:
+            raise ValueError('Неявки должны быть разделены как минимум 90 днями')
+        for name in ('TRUCK_DELAY_MINUTES', 'SUPPLY_INTRADAY_DELAY_MINUTES', 'SUPPLY_DELAY_DAYS',
+                     'ABSENCE_DAYS_PER_MONTH', 'EQUIPMENT_DOWNTIME_MINUTES'):
+            bounds = self.settings[name]
+            if len(bounds) != 2 or any(type(value) is not int or value < 0 for value in bounds) or bounds[0] > bounds[1]:
+                raise ValueError(f'Некорректный диапазон {name}')
+        if self.settings['ABSENCE_DAYS_PER_MONTH'][1] > 28:
+            raise ValueError('Число дней отсутствия превышает длину короткого месяца')
         for arrival, departure in self.settings['TRUCK_SCHEDULE']:
             if not self.settings['SHIFT_START_MINUTE'] <= arrival < departure <= self.settings['SHIFT_END_MINUTE']:
                 raise ValueError('Расписание машины должно быть внутри смены')
@@ -120,7 +144,7 @@ class Warehouse:
         end = self.settings['SHIFT_END_MINUTE']
         result = []
         for supply in self.supplies:
-            if supply['arrival_date'] <= day.isoformat() and supply['remaining_boxes'] > supply['receiving_boxes']:
+            if supply.get('arrived_at') and supply['remaining_boxes'] > supply['receiving_boxes']:
                 if minute + self.settings['RECEIPT_MINUTES'] <= end and self.can_receive(supply['sku']):
                     result.append(dict(kind='receipt', sku=supply['sku'], supply=supply,
                         key=(supply['arrival_date'] + 'T09:00:00', supply['created_date'] + 'T17:00:00',
@@ -151,11 +175,11 @@ class Warehouse:
     def schedule(self, day, minute):#назначение свободных сотрудников и техники на операции
         while True:
             workers = {task['worker'] for task in self.tasks}
-            worker = next((f'W{i+1}' for i in range(self.settings['EMPLOYEES']) if f'W{i+1}' not in workers), None)
+            worker = next((f'W{i+1}' for i in range(self.settings['EMPLOYEES']) if f'W{i+1}' not in workers and f'W{i+1}' in self.present_workers), None)
             if worker is None:
                 return
             devices = {task['equipment'] for task in self.tasks if task['equipment']}
-            equipment = next((f'T{i+1}' for i in range(self.settings['EQUIPMENT']) if f'T{i+1}' not in devices), None)
+            equipment = next((f'T{i+1}' for i in range(self.settings['EQUIPMENT']) if f'T{i+1}' not in devices and f'T{i+1}' not in self.blocked_equipment), None)
             chosen = next((task for task in self.candidates(day, minute)
                            if task['kind'] == 'load' or equipment is not None), None)
             if chosen is None:
@@ -240,8 +264,9 @@ class Warehouse:
                     created_date=day.isoformat(),
                     arrival_date=(day + timedelta(days=self.settings['SUPPLY_LEAD_DAYS'])).isoformat(),
                     ordered_boxes=quantity, remaining_boxes=quantity, receiving_boxes=0)
+                self.prepare_supply(supply)
                 self.supplies.append(supply)
-                self.replenishment.append(dict(date=day.isoformat(), **supply,
+                self.replenishment.append(dict(date=day.isoformat(), **{key: supply[key] for key in ('supply_id', 'sku', 'created_date', 'arrival_date', 'ordered_boxes', 'remaining_boxes', 'receiving_boxes')},
                     stock_boxes=physical, pending_boxes=demand, incoming_boxes=incoming,
                     stock_position=position, position_after_order=position + quantity))
                 self.log(self.timestamp(day, self.settings['SHIFT_END_MINUTE']), 'supply_ordered',
@@ -280,6 +305,58 @@ class Warehouse:
             if not 0 <= supply['receiving_boxes'] <= supply['remaining_boxes']:
                 raise ValueError('Некорректная приёмка поставки')
 
+    def prepare_supply(self, supply):#плановая дата и скрытое время фактического прибытия поставки
+        if 'scheduled_arrival_at' in supply:
+            return
+        deviation = self.conditions.supply(supply['supply_id'])
+        planned = self.timestamp(date.fromisoformat(supply['arrival_date']), self.settings['SHIFT_START_MINUTE'])
+        scheduled = planned + timedelta(days=deviation['delay_days'], minutes=deviation['delay_minutes'])
+        supply.update(planned_arrival_at=planned.isoformat(), scheduled_arrival_at=scheduled.isoformat(),
+                      **deviation)
+
+    def prepare_truck(self, day, index, arrival, departure):#задержка, редкая неявка и перенос рейса после закрытия
+        deviation = self.conditions.truck(day, index, len(self.settings['TRUCK_SCHEDULE']))
+        planned_arrival = self.timestamp(day, arrival)
+        planned_departure = self.timestamp(day, departure)
+        scheduled_arrival = planned_arrival + timedelta(minutes=deviation['delay_minutes'])
+        scheduled_departure = planned_departure + timedelta(minutes=deviation['delay_minutes'])
+        close = self.timestamp(day, self.settings['SHIFT_END_MINUTE'])
+        rolled_over = scheduled_arrival > close
+        if rolled_over:
+            scheduled_arrival = self.timestamp(day + timedelta(days=1), self.settings['SHIFT_START_MINUTE'])
+            scheduled_departure = min(scheduled_arrival + timedelta(minutes=departure-arrival),
+                                      self.timestamp(day+timedelta(days=1), self.settings['SHIFT_END_MINUTE']))
+        else:
+            scheduled_departure = min(scheduled_departure, close)
+        truck = dict(truck_id=f'{day.isoformat()}-T{index}', planned_date=day.isoformat(),
+            planned_arrival_at=planned_arrival.isoformat(), planned_departure_at=planned_departure.isoformat(),
+            scheduled_arrival_at=scheduled_arrival.isoformat(), departure_at=scheduled_departure.isoformat(),
+            arrival_at='', actual_departure_at='', capacity_boxes=self.settings['TRUCK_CAPACITY'],
+            status='planned', loaded_boxes=0, loading_boxes=0, manifest=[], rolled_over=rolled_over, **deviation)
+        self.trucks.append(truck)
+        return truck
+
+    def update_downtime(self, day, minute):#ожидание завершения начатой операции, затем фактический простой
+        downtime = self.shift_conditions[day.isoformat()]['downtime']
+        if not downtime:
+            return
+        moment = self.timestamp(day, minute)
+        device = downtime['equipment_id']
+        if downtime['status'] == 'planned' and minute >= downtime['planned_start_minute']:
+            downtime['status'] = 'requested'
+            self.blocked_equipment.add(device)
+            self.log(moment, 'equipment_downtime_requested', equipment=device)
+        if downtime['status'] == 'requested' and not any(task['equipment'] == device for task in self.tasks):
+            downtime['status'] = 'active'
+            downtime['actual_start_minute'] = minute
+            downtime['actual_end_minute'] = min(minute+downtime['duration_minutes'], self.settings['SHIFT_END_MINUTE'])
+            self.log(moment, 'equipment_downtime_started', equipment=device,
+                     finish_at=self.timestamp(day, downtime['actual_end_minute']).isoformat())
+        if downtime['status'] == 'active' and minute >= downtime['actual_end_minute']:
+            downtime['status'] = 'finished'
+            self.blocked_equipment.discard(device)
+            self.log(moment, 'equipment_downtime_ended', equipment=device)
+
     def run_day(self, day, orders):#последовательная обработка событий дня без доступа к будущим заказам
         if self.tasks:
             raise ValueError('Операции прошлого дня не завершены')
@@ -290,15 +367,14 @@ class Warehouse:
                 raise ValueError('Дата заказа не соответствует дню')
             if datetime.fromisoformat(source['created_at']) > self.timestamp(day, end):
                 raise ValueError('Время заказа позже закрытия дня')
-        today_trucks = []
+        conditions = self.conditions.shift(day)
+        self.shift_conditions[day.isoformat()] = conditions
+        self.present_workers = {f'W{i+1}' for i in range(self.settings['EMPLOYEES'])} - set(conditions['absent_workers'])
+        self.blocked_equipment = set()
+        for supply in self.supplies:
+            self.prepare_supply(supply)
         for index, (arrival, departure) in enumerate(self.settings['TRUCK_SCHEDULE'], 1):
-            truck = dict(truck_id=f'{day.isoformat()}-T{index}',
-                arrival_at=self.timestamp(day, arrival).isoformat(),
-                departure_at=self.timestamp(day, departure).isoformat(),
-                capacity_boxes=self.settings['TRUCK_CAPACITY'], status='planned',
-                loaded_boxes=0, loading_boxes=0, manifest=[])
-            self.trucks.append(truck)
-            today_trucks.append(truck)
+            self.prepare_truck(day, index, arrival, departure)
         next_order = 0
         for minute in range(end + 1):
             moment = self.timestamp(day, minute)
@@ -306,18 +382,29 @@ class Warehouse:
             for task in due:
                 self.complete_task(task, moment)
             self.tasks[:] = [task for task in self.tasks if task not in due]
-            for truck in today_trucks:
-                if truck['arrival_at'] == moment.isoformat():
-                    truck['status'] = 'arrived'
-                    self.log(moment, 'truck_arrived', truck_id=truck['truck_id'])
-                if truck['departure_at'] == moment.isoformat():
+            self.update_downtime(day, minute)
+            for truck in self.trucks:
+                if truck['status'] == 'planned':
+                    due_at = truck['planned_arrival_at'] if truck['no_show'] else truck['scheduled_arrival_at']
+                    if due_at == moment.isoformat():
+                        if truck['no_show']:
+                            truck['status'] = 'cancelled'
+                            self.log(moment, 'truck_no_show', truck_id=truck['truck_id'])
+                        else:
+                            truck['status'] = 'arrived'
+                            truck['arrival_at'] = moment.isoformat()
+                            self.log(moment, 'truck_arrived', truck_id=truck['truck_id'])
+                if truck['status'] == 'arrived' and truck['departure_at'] == moment.isoformat():
                     self.depart(truck, moment)
+                    truck['actual_departure_at'] = moment.isoformat()
             if minute == self.settings['SHIFT_START_MINUTE']:
-                for supply in self.supplies:
-                    if supply['arrival_date'] <= day.isoformat() and not supply.get('arrived_at'):
-                        supply['arrived_at'] = moment.isoformat()
-                        self.log(moment, 'supply_arrived', supply['remaining_boxes'], supply['sku'],
-                                 supply_id=supply['supply_id'])
+                for worker in conditions['absent_workers']:
+                    self.log(moment, 'employee_absent', worker=worker)
+                self.log(moment, 'shift_opened')
+            for supply in self.supplies:
+                if not supply.get('arrived_at') and supply['scheduled_arrival_at'] <= moment.isoformat():
+                    supply['arrived_at'] = moment.isoformat()
+                    self.log(moment, 'supply_arrived', supply['remaining_boxes'], supply['sku'], supply_id=supply['supply_id'])
             while next_order < len(arrival_orders) and datetime.fromisoformat(arrival_orders[next_order]['created_at']) <= moment:
                 self.register_order(arrival_orders[next_order], moment)
                 next_order += 1
@@ -344,5 +431,5 @@ class Warehouse:
 
     def state(self, day):#конечное состояние для проверки и дальнейшего расширения модели
         return dict(date=day.isoformat(), stock=self.stock, orders=list(self.orders.values()),
-                    supplies=self.supplies, trucks=self.trucks,
+                    supplies=self.supplies, trucks=self.trucks, shift_conditions=self.shift_conditions,
                     initial_boxes=self.initial, accepted_boxes=self.accepted, shipped_boxes=self.sent)
