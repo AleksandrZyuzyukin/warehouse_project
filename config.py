@@ -19,5 +19,17 @@ INITIAL_STOCK = {
 # Вероятности срока отгрузки: сегодня, завтра, через два дня.
 DEADLINE_OFFSETS = (0, 1, 2)
 DEADLINE_WEIGHTS = (25, 65, 10)
-ORDER_START_MINUTE = 8 * 60 + 30#начало рабочего дня платформы оформления заказов
-ORDER_END_MINUTE = 15 * 60#конец рабочего дня платформы оформления заказов
+ORDER_START_MINUTE = 8 * 60 + 30
+ORDER_END_MINUTE = 15 * 60
+
+# Смена, ресурсы и время на одну коробку.
+SHIFT_START_MINUTE = 9 * 60
+SHIFT_END_MINUTE = 17 * 60
+EMPLOYEES = 4
+EQUIPMENT = 2
+RECEIPT_MINUTES = 2
+PICK_MINUTES = 3
+LOAD_MINUTES = 1
+WAITING_CAPACITY = 100
+TRUCK_CAPACITY = 80
+TRUCK_SCHEDULE = ((11 * 60, 12 * 60 + 30), (15 * 60, 16 * 60 + 30))
