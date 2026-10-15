@@ -1,4 +1,4 @@
-"""Приёмка, сборка, погрузка и отправка машин внутри последовательных смен."""
+#Приёмка, сборка, погрузка и отправка машин внутри последовательных смен.
 
 import argparse
 import csv
@@ -37,11 +37,15 @@ FIELDS = {
     'replenishment': ['date', 'supply_id', 'sku', 'created_date', 'arrival_date', 'ordered_boxes',
                       'remaining_boxes', 'receiving_boxes', 'stock_boxes', 'pending_boxes',
                       'incoming_boxes', 'stock_position', 'position_after_order'],
+    'order_requests': ['request_id', 'timestamp', 'action', 'order_id', 'sku', 'new_boxes', 'status', 'reason',
+                       'before_boxes', 'after_boxes', 'cancelled_boxes', 'quantity_delta_boxes',
+                       'released_reserved_boxes', 'protected_boxes'],
     'summary': ['date', 'seed', 'orders', 'requested_boxes', 'accepted_boxes', 'picked_boxes',
                 'loaded_boxes', 'shipped_boxes', 'stock_boxes', 'waiting_boxes', 'reserved_boxes',
                 'unpicked_boxes', 'unfinished_boxes', 'unfinished_orders', 'overdue_boxes',
                 'late_shipped_boxes', 'incoming_boxes', 'ordered_boxes', 'present_employees',
-                'equipment_downtime_minutes', 'truck_no_shows', 'late_truck_arrivals', 'late_supply_arrivals'],
+                'equipment_downtime_minutes', 'truck_no_shows', 'late_truck_arrivals', 'late_supply_arrivals',
+                'order_requests', 'accepted_order_requests', 'cancelled_boxes', 'quantity_delta_boxes'],
 }
 
 
@@ -141,7 +145,10 @@ def save_day(tables, warehouse, day, orders, events, seed):#снимки сос�
         equipment_downtime_minutes=sum(unavailable_equipment.values()),
         truck_no_shows=sum(e['event_type'] == 'truck_no_show' for e in events),
         late_truck_arrivals=sum(t['arrival_at'][:10] == date_text and t['arrival_at'] > t['planned_arrival_at'] for t in warehouse.trucks),
-        late_supply_arrivals=sum(s.get('arrived_at', '')[:10] == date_text and s['arrived_at'] > s['planned_arrival_at'] for s in warehouse.supplies)))
+        late_supply_arrivals=sum(s.get('arrived_at', '')[:10] == date_text and s['arrived_at'] > s['planned_arrival_at'] for s in warehouse.supplies),
+        order_requests=sum(row['timestamp'][:10] == date_text for row in warehouse.order_requests),
+        accepted_order_requests=sum(row['timestamp'][:10] == date_text and row['status'] == 'accepted' for row in warehouse.order_requests),
+        cancelled_boxes=event_total('order_boxes_cancelled'), quantity_delta_boxes=event_total('order_quantity_changed')))
 
 
 def run(day, output, seed=SEED, days=SIMULATION_DAYS, stock=None, settings=None, order_generator=generate_orders):#моделирование нескольких смен и сохранение таблиц
@@ -159,6 +166,7 @@ def run(day, output, seed=SEED, days=SIMULATION_DAYS, stock=None, settings=None,
     tables['events'] = warehouse.events
     tables['reservations'] = warehouse.reservations
     tables['replenishment'] = warehouse.replenishment
+    tables['order_requests'] = warehouse.order_requests
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     for name, rows in tables.items():
@@ -173,11 +181,12 @@ def main():#параметры запуска, моделирование и в�
     parser.add_argument('--days', type=int, default=SIMULATION_DAYS)
     parser.add_argument('--seed', type=int, default=SEED)
     parser.add_argument('--output', type=Path, default=Path('output'))
+    parser.add_argument('--no-order-changes', action='store_true', help='Отключить отмены и изменения заказов')
     parser.add_argument('--no-variability', action='store_true', help='Запуск без случайных отклонений')
     args = parser.parse_args()
     if args.days <= 0:
         parser.error('--days должно быть положительным')
-    summaries = run(args.date, args.output, args.seed, args.days, settings={'VARIABILITY_ENABLED': not args.no_variability})
+    summaries = run(args.date, args.output, args.seed, args.days, settings={'VARIABILITY_ENABLED': not args.no_variability, 'ORDER_CHANGES_ENABLED': not args.no_order_changes})
     last = summaries[-1]
     print(f"Дней: {len(summaries)}; отправлено: {sum(row['shipped_boxes'] for row in summaries)} коробок")
     print(f"Конец {last['date']}: хранение {last['stock_boxes']}; ожидание {last['waiting_boxes']}; незавершено {last['unfinished_boxes']}")

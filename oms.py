@@ -35,3 +35,46 @@ def generate_orders(day, skus, seed):#генерация заказов с вр�
             "lines": lines,
         })
     return orders
+
+
+def request_rng(seed, identifier):#отдельное воспроизводимое зерно запросов изменения заказа
+    import hashlib
+    value = f'{seed}|order_requests|{identifier}'.encode('utf-8')
+    return random.Random(int.from_bytes(hashlib.sha256(value).digest(), 'big'))
+
+
+def generate_request_slots(day, seed, settings):#1–2 запроса на календарную неделю с понедельника по воскресенье
+    if not settings['ORDER_CHANGES_ENABLED']:
+        return []
+    monday = day - timedelta(days=day.weekday())
+    rng = request_rng(seed, monday.isoformat())
+    count = rng.randint(*settings['ORDER_REQUESTS_PER_WEEK'])
+    days = sorted(rng.sample(range(7), count))
+    slots = []
+    for index, offset in enumerate(days, 1):
+        minute = rng.randint(settings['ORDER_REQUEST_START_MINUTE'], settings['ORDER_REQUEST_END_MINUTE'])
+        action = rng.choice(('cancel', 'change_quantity'))
+        event_day = monday + timedelta(days=offset)
+        if event_day == day:
+            slots.append(dict(request_id=f'{monday.isoformat()}-C{index}',
+                timestamp=(datetime.combine(day, time())+timedelta(minutes=minute)).isoformat(),
+                action=action))
+    return slots
+
+
+def generate_order_request(slot, orders, seed, settings):#выбор уже поступившего заказа и новых количеств одной строки
+    rng = request_rng(seed, slot['request_id'])
+    eligible = [order for order in orders if any(line['unpicked_boxes'] > line['picking_boxes'] for line in order['lines'])]
+    candidates = sorted(eligible or orders, key=lambda order: order['order_id'])
+    request = dict(slot, order_id='', sku='', new_boxes='')
+    if not candidates:
+        return request
+    order = rng.choice(candidates)
+    request['order_id'] = order['order_id']
+    if slot['action'] == 'change_quantity':
+        eligible_lines = [line for line in order['lines'] if line['unpicked_boxes'] > line['picking_boxes']]
+        line = rng.choice(eligible_lines or order['lines'])
+        delta = rng.randint(*settings['ORDER_CHANGE_BOXES']) * rng.choice((-1, 1))
+        request['sku'] = line['sku']
+        request['new_boxes'] = max(1, line['ordered_boxes']-line['cancelled_boxes']+delta)
+    return request

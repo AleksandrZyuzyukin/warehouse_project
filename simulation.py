@@ -5,6 +5,7 @@ from datetime import date, datetime, time, timedelta
 
 import config
 from conditions import Conditions
+from oms import generate_request_slots, generate_order_request
 from wms import total_boxes, receive_boxes, ship_boxes, validate_stock
 
 
@@ -17,7 +18,9 @@ class Warehouse:
                  'TRUCK_NO_SHOW_INTERVAL_DAYS', 'TRUCK_DELAY_PROBABILITY', 'TRUCK_DELAY_MINUTES',
                  'SUPPLY_INTRADAY_DELAY_PROBABILITY', 'SUPPLY_DAY_DELAY_PROBABILITY',
                  'SUPPLY_INTRADAY_DELAY_MINUTES', 'SUPPLY_DELAY_DAYS', 'ABSENCE_DAYS_PER_MONTH',
-                 'EQUIPMENT_DOWNTIME_PROBABILITY', 'EQUIPMENT_DOWNTIME_MINUTES')
+                 'EQUIPMENT_DOWNTIME_PROBABILITY', 'EQUIPMENT_DOWNTIME_MINUTES',
+                 'ORDER_CHANGES_ENABLED', 'ORDER_REQUESTS_PER_WEEK', 'ORDER_CHANGE_BOXES',
+                 'ORDER_REQUEST_START_MINUTE', 'ORDER_REQUEST_END_MINUTE')
         self.settings = {name: getattr(config, name) for name in names}
         self.settings.update(settings or {})
         self.conditions = Conditions(seed, self.settings)
@@ -34,6 +37,8 @@ class Warehouse:
         self.tasks, self.completed_tasks = [], set()
         self.events, self.reservations, self.replenishment = [], [], []
         self.sequence = 0
+        self.seed = seed
+        self.order_requests, self.request_results = [], {}
         for name in ('EMPLOYEES', 'EQUIPMENT', 'RECEIPT_MINUTES', 'PICK_MINUTES',
                      'LOAD_MINUTES', 'WAITING_CAPACITY', 'TRUCK_CAPACITY'):
             if type(self.settings[name]) is not int or self.settings[name] <= 0:
@@ -49,12 +54,17 @@ class Warehouse:
         if self.settings['TRUCK_NO_SHOW_INTERVAL_DAYS'] < 90:
             raise ValueError('Неявки должны быть разделены как минимум 90 днями')
         for name in ('TRUCK_DELAY_MINUTES', 'SUPPLY_INTRADAY_DELAY_MINUTES', 'SUPPLY_DELAY_DAYS',
-                     'ABSENCE_DAYS_PER_MONTH', 'EQUIPMENT_DOWNTIME_MINUTES'):
+                     'ABSENCE_DAYS_PER_MONTH', 'EQUIPMENT_DOWNTIME_MINUTES', 'ORDER_REQUESTS_PER_WEEK', 'ORDER_CHANGE_BOXES'):
             bounds = self.settings[name]
             if len(bounds) != 2 or any(type(value) is not int or value < 0 for value in bounds) or bounds[0] > bounds[1]:
                 raise ValueError(f'Некорректный диапазон {name}')
         if self.settings['ABSENCE_DAYS_PER_MONTH'][1] > 28:
             raise ValueError('Число дней отсутствия превышает длину короткого месяца')
+        if not 0 <= self.settings['ORDER_REQUESTS_PER_WEEK'][0] <= self.settings['ORDER_REQUESTS_PER_WEEK'][1] <= 7:
+            raise ValueError('Число запросов недели должно быть от 0 до 7')
+        if not self.settings['SHIFT_START_MINUTE'] <= self.settings['ORDER_REQUEST_START_MINUTE'] <= self.settings['ORDER_REQUEST_END_MINUTE'] <= self.settings['SHIFT_END_MINUTE']:
+            if self.settings['ORDER_CHANGES_ENABLED']:
+                raise ValueError('Время запросов должно быть внутри смены')
         for arrival, departure in self.settings['TRUCK_SCHEDULE']:
             if not self.settings['SHIFT_START_MINUTE'] <= arrival < departure <= self.settings['SHIFT_END_MINUTE']:
                 raise ValueError('Расписание машины должно быть внутри смены')
@@ -247,7 +257,7 @@ class Warehouse:
             self.sent[sku] += 1
             self.log(moment, 'shipped', 1, sku, order_id, truck_id=truck['truck_id'])
         for order_id in {identifier for identifier, _ in truck['manifest']}:
-            if all(line['shipped_boxes'] == line['ordered_boxes'] for line in self.orders[order_id]['lines']):
+            if all(line['unpicked_boxes'] + line['waiting_boxes'] == 0 for line in self.orders[order_id]['lines']):
                 self.active_order_ids.discard(order_id)
         truck['status'] = 'departed'
         self.log(moment, 'truck_departed', truck['loaded_boxes'], truck_id=truck['truck_id'])
@@ -305,6 +315,78 @@ class Warehouse:
             if not 0 <= supply['receiving_boxes'] <= supply['remaining_boxes']:
                 raise ValueError('Некорректная приёмка поставки')
 
+    def apply_order_request(self, request, moment):#отмена свободной части или изменение строки без затрагивания начатой сборки
+        identifier = request['request_id']
+        if identifier in self.request_results:
+            previous = self.request_results[identifier]
+            if previous['source'] != request:
+                raise ValueError('Идентификатор запроса повторён с другим содержимым')
+            return previous['result']
+        if datetime.fromisoformat(request['timestamp']) > moment:
+            raise ValueError('Запрос ещё не поступил')
+        order = self.orders.get(request['order_id'])
+        result = dict(request, status='rejected', reason='', before_boxes=0, after_boxes=0,
+                      cancelled_boxes=0, quantity_delta_boxes=0, released_reserved_boxes=0,
+                      protected_boxes=0)
+        self.log(moment, 'order_request_received', order_id=request['order_id'], sku=request.get('sku', '') if request.get('sku', '') in self.stock else '')
+        if order is None:
+            result['reason'] = 'unknown_order'
+        elif order['created_at'] > request['timestamp']:
+            result['reason'] = 'order_not_received_at_request_time'
+        elif request['order_id'] not in self.active_order_ids:
+            result['reason'] = 'order_closed'
+        elif request['action'] == 'cancel':
+            before = sum(line['ordered_boxes']-line['cancelled_boxes'] for line in order['lines'])
+            result['before_boxes'] = before
+            for line in order['lines']:
+                removed = line['unpicked_boxes']-line['picking_boxes']
+                result['protected_boxes'] += line['waiting_boxes']+line['shipped_boxes']+line['picking_boxes']
+                if removed == 0:
+                    continue
+                reserved_before = line['reserved_boxes']
+                line['unpicked_boxes'] -= removed
+                line['cancelled_boxes'] += removed
+                line['reserved_boxes'] = min(line['reserved_boxes'], line['unpicked_boxes'])
+                result['released_reserved_boxes'] += reserved_before-line['reserved_boxes']
+                result['cancelled_boxes'] += removed
+                self.log(moment, 'order_boxes_cancelled', removed, line['sku'], order['order_id'])
+            result['after_boxes'] = before-result['cancelled_boxes']
+            result['status'] = 'accepted' if result['cancelled_boxes'] else 'rejected'
+            result['reason'] = 'cancelled_unstarted_part' if result['cancelled_boxes'] else 'no_unstarted_boxes'
+        elif request['action'] == 'change_quantity':
+            line = next((line for line in order['lines'] if line['sku'] == request['sku']), None)
+            new = request['new_boxes']
+            if line is None:
+                result['reason'] = 'unknown_sku'
+            elif type(new) is not int or new < 0:
+                result['reason'] = 'invalid_quantity'
+            else:
+                before = line['ordered_boxes']-line['cancelled_boxes']
+                protected = line['waiting_boxes']+line['shipped_boxes']+line['picking_boxes']
+                result.update(before_boxes=before, after_boxes=before, protected_boxes=protected)
+                if new < protected:
+                    result['reason'] = 'quantity_below_protected_boxes'
+                elif new == before:
+                    result['reason'] = 'quantity_unchanged'
+                else:
+                    delta = new-before
+                    reserved_before = line['reserved_boxes']
+                    line['ordered_boxes'] += delta
+                    line['unpicked_boxes'] += delta
+                    line['reserved_boxes'] = min(line['reserved_boxes'], line['unpicked_boxes'])
+                    result.update(status='accepted', reason='quantity_changed', after_boxes=new,
+                        quantity_delta_boxes=delta, released_reserved_boxes=reserved_before-line['reserved_boxes'])
+                    self.log(moment, 'order_quantity_changed', delta, line['sku'], order['order_id'])
+        else:
+            result['reason'] = 'unknown_action'
+        if order and all(line['unpicked_boxes']+line['waiting_boxes'] == 0 for line in order['lines']):
+            self.active_order_ids.discard(order['order_id'])
+        self.log(moment, 'order_request_' + result['status'], order_id=request['order_id'])
+        self.order_requests.append(result)
+        self.request_results[identifier] = {'source': deepcopy(request), 'result': result}
+        self.validate(full=True)
+        return result
+
     def prepare_supply(self, supply):#плановая дата и скрытое время фактического прибытия поставки
         if 'scheduled_arrival_at' in supply:
             return
@@ -357,7 +439,7 @@ class Warehouse:
             self.blocked_equipment.discard(device)
             self.log(moment, 'equipment_downtime_ended', equipment=device)
 
-    def run_day(self, day, orders):#последовательная обработка событий дня без доступа к будущим заказам
+    def run_day(self, day, orders, requests=None):#последовательная обработка событий дня без доступа к будущим заказам
         if self.tasks:
             raise ValueError('Операции прошлого дня не завершены')
         end = self.settings['SHIFT_END_MINUTE']
@@ -375,6 +457,11 @@ class Warehouse:
             self.prepare_supply(supply)
         for index, (arrival, departure) in enumerate(self.settings['TRUCK_SCHEDULE'], 1):
             self.prepare_truck(day, index, arrival, departure)
+        request_slots = generate_request_slots(day, self.seed, self.settings) if requests is None else sorted(requests, key=lambda row: (row['timestamp'], row['request_id']))
+        for request in request_slots:
+            if request['timestamp'][:10] != day.isoformat() or not self.timestamp(day, self.settings['SHIFT_START_MINUTE']).isoformat() <= request['timestamp'] <= self.timestamp(day, end).isoformat():
+                raise ValueError('Время запроса должно быть внутри текущей смены')
+        next_request = 0
         next_order = 0
         for minute in range(end + 1):
             moment = self.timestamp(day, minute)
@@ -408,6 +495,11 @@ class Warehouse:
             while next_order < len(arrival_orders) and datetime.fromisoformat(arrival_orders[next_order]['created_at']) <= moment:
                 self.register_order(arrival_orders[next_order], moment)
                 next_order += 1
+            while next_request < len(request_slots) and request_slots[next_request]['timestamp'] <= moment.isoformat():
+                slot = request_slots[next_request]
+                request = slot if requests is not None else generate_order_request(slot, list(self.orders.values()), self.seed, self.settings)
+                self.apply_order_request(request, moment)
+                next_request += 1
             self.reserve(moment)
             if self.settings['SHIFT_START_MINUTE'] <= minute < end:
                 self.schedule(day, minute)
@@ -419,8 +511,10 @@ class Warehouse:
         self.log(self.timestamp(day, end), 'shift_closed')
 
     def line_status(self, line):#статус строки по ещё не собранным, подготовленным и отправленным коробкам
-        if line['shipped_boxes'] == line['ordered_boxes']:
-            return 'completed'
+        if line['ordered_boxes'] == line['cancelled_boxes']:
+            return 'cancelled'
+        if line['unpicked_boxes'] + line['waiting_boxes'] == 0:
+            return 'completed_with_cancellation' if line['cancelled_boxes'] else 'completed'
         if line['shipped_boxes']:
             return 'partially_shipped'
         if line['unpicked_boxes'] == 0:
@@ -431,5 +525,5 @@ class Warehouse:
 
     def state(self, day):#конечное состояние для проверки и дальнейшего расширения модели
         return dict(date=day.isoformat(), stock=self.stock, orders=list(self.orders.values()),
-                    supplies=self.supplies, trucks=self.trucks, shift_conditions=self.shift_conditions,
+                    supplies=self.supplies, trucks=self.trucks, shift_conditions=self.shift_conditions, order_requests=self.order_requests,
                     initial_boxes=self.initial, accepted_boxes=self.accepted, shipped_boxes=self.sent)

@@ -61,3 +61,4 @@ class Conditions:
                                 planned_start_minute=start, duration_minutes=duration,
                                 status='planned', actual_start_minute=None, actual_end_minute=None)
         return {'absent_workers': absent, 'downtime': downtime}
+
